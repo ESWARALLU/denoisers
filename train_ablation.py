@@ -75,6 +75,7 @@ parser.add_argument('--save_model_dir', type=str, default='./checkpoints/ablatio
 # Optional settings
 parser.add_argument('--is_use_cloudmask', type=bool, default=False)
 parser.add_argument('--cloud_threshold', type=float, default=0.2)
+parser.add_argument('--is_test', type=bool, default=False, help='whether in test mode')
 parser.add_argument('--gpu_ids', type=str, default='0')
 parser.add_argument('--dry_run', action='store_true', help='Test checkpoint loading without full training')
 
