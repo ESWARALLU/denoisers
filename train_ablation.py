@@ -177,65 +177,8 @@ def load_pretrained_checkpoint(model, checkpoint_path, variant):
         print(f"⚠ Skipped {len(skipped_keys)} incompatible keys (will be initialized randomly)")
         if variant == 'full_denoising':
             print("  (This is expected for 'full_denoising' variant - sar_denoiser is new)")
-    
+
     return model
-
-
-def load_resume_checkpoint(model, optimizer, lr_scheduler, checkpoint_path, variant):
-    """
-    Load resume checkpoint to continue ablation training.
-    Loads complete training state including model, optimizer, scheduler, and training progress.
-    
-    Returns:
-        tuple: (model, optimizer, lr_scheduler, start_epoch, best_val_psnr)
-    """
-    print(f"\nResuming from checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    
-    # Verify checkpoint variant matches requested variant
-    if 'variant' in checkpoint:
-        ckpt_variant = checkpoint['variant']
-        if ckpt_variant != variant:
-            print(f"⚠ WARNING: Checkpoint variant '{ckpt_variant}' does not match requested variant '{variant}'")
-            print(f"  Proceeding anyway, but results may be unexpected.")
-    
-    # Load model state dict
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print("✓ Loaded model state")
-    else:
-        raise KeyError("Checkpoint does not contain 'model_state_dict'")
-    
-    # Load optimizer state dict
-    if 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print("✓ Loaded optimizer state")
-    else:
-        print("⚠ WARNING: Checkpoint does not contain optimizer state, initializing fresh optimizer")
-    
-    # Load learning rate scheduler state dict
-    if 'lr_scheduler_state_dict' in checkpoint:
-        lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-        print("✓ Loaded learning rate scheduler state")
-    else:
-        print("⚠ WARNING: Checkpoint does not contain LR scheduler state, initializing fresh scheduler")
-    
-    # Get training progress
-    start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
-    best_val_psnr = checkpoint.get('best_val_psnr', 0.0)
-    
-    print(f"✓ Resuming from epoch {start_epoch}")
-    print(f"✓ Best validation PSNR so far: {best_val_psnr:.2f} dB")
-    
-    # Print loaded configuration for verification
-    if 'opts' in checkpoint:
-        ckpt_opts = checkpoint['opts']
-        print(f"\nCheckpoint configuration:")
-        print(f"  Variant: {getattr(ckpt_opts, 'variant', 'N/A')}")
-        print(f"  Learning rate: {getattr(ckpt_opts, 'lr', 'N/A')}")
-        print(f"  Batch size: {getattr(ckpt_opts, 'batch_sz', 'N/A')}")
-    
-    return model, optimizer, lr_scheduler, start_epoch, best_val_psnr
 
 
 def get_trainable_params(model):
@@ -405,30 +348,74 @@ if __name__ == '__main__':
         if opts.pretrained_path is None:
             raise ValueError("Either --pretrained_path or --resume_checkpoint must be provided")
     
-    # Move model to device first (needed for optimizer initialization)
+    # Move model to device first
     model = model.to(device)
     
-    # Setup optimizer and scheduler (needed before loading resume checkpoint)
-    # Only optimize trainable parameters (will be set correctly below)
+    # Load checkpoint based on mode (but DON'T load optimizer/scheduler yet for resume mode)
+    if resume_mode:
+        # For resume mode: Load model weights first, then freeze, then create optimizer, then load optimizer state
+        print(f"\nLoading model weights from: {opts.resume_checkpoint}")
+        checkpoint = torch.load(opts.resume_checkpoint, map_location='cpu', weights_only=False)
+        
+        # Verify checkpoint variant matches requested variant
+        if 'variant' in checkpoint:
+            ckpt_variant = checkpoint['variant']
+            if ckpt_variant != opts.variant:
+                print(f"⚠ WARNING: Checkpoint variant '{ckpt_variant}' does not match requested variant '{opts.variant}'")
+                print(f"  Proceeding anyway, but results may be unexpected.")
+        
+        # Load model state dict
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("✓ Loaded model state")
+        else:
+            raise KeyError("Checkpoint does not contain 'model_state_dict'")
+        
+        # Get training progress
+        start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
+        best_val_psnr = checkpoint.get('best_val_psnr', 0.0)
+        
+    else:
+        # Load pretrained checkpoint (selective loading)
+        model = load_pretrained_checkpoint(model, opts.pretrained_path, opts.variant)
+    
+    # Freeze modules (CRITICAL: do this BEFORE creating optimizer)
+    print("\nFreezing shared modules...")
+    freeze_modules(model, opts.variant)
+    
+    # NOW create optimizer with the correct frozen parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=opts.lr)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=opts.lr_step, gamma=0.5
     )
     
-    # Load checkpoint based on mode
+    # If resuming, NOW load optimizer and scheduler state (after optimizer is created with correct params)
     if resume_mode:
-        # Load complete training state from ablation checkpoint
-        model, optimizer, lr_scheduler, start_epoch, best_val_psnr = load_resume_checkpoint(
-            model, optimizer, lr_scheduler, opts.resume_checkpoint, opts.variant
-        )
-    else:
-        # Load pretrained checkpoint (selective loading)
-        model = load_pretrained_checkpoint(model, opts.pretrained_path, opts.variant)
-    
-    # Freeze modules (important: do this after loading, before training)
-    print("\nFreezing shared modules...")
-    freeze_modules(model, opts.variant)
+        # Load optimizer state dict
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("✓ Loaded optimizer state")
+        else:
+            print("⚠ WARNING: Checkpoint does not contain optimizer state, using fresh optimizer")
+        
+        # Load learning rate scheduler state dict
+        if 'lr_scheduler_state_dict' in checkpoint:
+            lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+            print("✓ Loaded learning rate scheduler state")
+        else:
+            print("⚠ WARNING: Checkpoint does not contain LR scheduler state, using fresh scheduler")
+        
+        print(f"✓ Resuming from epoch {start_epoch}")
+        print(f"✓ Best validation PSNR so far: {best_val_psnr:.2f} dB")
+        
+        # Print loaded configuration for verification
+        if 'opts' in checkpoint:
+            ckpt_opts = checkpoint['opts']
+            print(f"\nCheckpoint configuration:")
+            print(f"  Variant: {getattr(ckpt_opts, 'variant', 'N/A')}")
+            print(f"  Learning rate: {getattr(ckpt_opts, 'lr', 'N/A')}")
+            print(f"  Batch size: {getattr(ckpt_opts, 'batch_sz', 'N/A')}")
     
     # Print parameter statistics
     param_stats = get_trainable_params(model)
