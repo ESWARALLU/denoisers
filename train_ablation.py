@@ -53,8 +53,10 @@ parser.add_argument('--variant', type=str, required=True,
                     help='Ablation variant to train: original (with gating), no_denoising (no noise handling), full_denoising (explicit denoiser)')
 
 # Checkpoint and data paths
-parser.add_argument('--pretrained_path', type=str, required=True,
-                    help='Path to pretrained original model checkpoint')
+parser.add_argument('--pretrained_path', type=str, default=None,
+                    help='Path to pretrained original model checkpoint (required if not resuming)')
+parser.add_argument('--resume_checkpoint', type=str, default=None,
+                    help='Path to ablation checkpoint to resume training from (takes priority over pretrained_path)')
 parser.add_argument('--input_data_folder', type=str, default='../data')
 parser.add_argument('--data_list_filepath', type=str, default='../data/data.csv')
 
@@ -145,7 +147,7 @@ def load_pretrained_checkpoint(model, checkpoint_path, variant):
     Initialize new modules (denoiser/gating) with random weights.
     """
     print(f"\nLoading pretrained checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
     # Extract model state dict
     if 'model_state_dict' in checkpoint:
@@ -177,6 +179,63 @@ def load_pretrained_checkpoint(model, checkpoint_path, variant):
             print("  (This is expected for 'full_denoising' variant - sar_denoiser is new)")
     
     return model
+
+
+def load_resume_checkpoint(model, optimizer, lr_scheduler, checkpoint_path, variant):
+    """
+    Load resume checkpoint to continue ablation training.
+    Loads complete training state including model, optimizer, scheduler, and training progress.
+    
+    Returns:
+        tuple: (model, optimizer, lr_scheduler, start_epoch, best_val_psnr)
+    """
+    print(f"\nResuming from checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    # Verify checkpoint variant matches requested variant
+    if 'variant' in checkpoint:
+        ckpt_variant = checkpoint['variant']
+        if ckpt_variant != variant:
+            print(f"⚠ WARNING: Checkpoint variant '{ckpt_variant}' does not match requested variant '{variant}'")
+            print(f"  Proceeding anyway, but results may be unexpected.")
+    
+    # Load model state dict
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("✓ Loaded model state")
+    else:
+        raise KeyError("Checkpoint does not contain 'model_state_dict'")
+    
+    # Load optimizer state dict
+    if 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print("✓ Loaded optimizer state")
+    else:
+        print("⚠ WARNING: Checkpoint does not contain optimizer state, initializing fresh optimizer")
+    
+    # Load learning rate scheduler state dict
+    if 'lr_scheduler_state_dict' in checkpoint:
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
+        print("✓ Loaded learning rate scheduler state")
+    else:
+        print("⚠ WARNING: Checkpoint does not contain LR scheduler state, initializing fresh scheduler")
+    
+    # Get training progress
+    start_epoch = checkpoint.get('epoch', 0) + 1  # Resume from next epoch
+    best_val_psnr = checkpoint.get('best_val_psnr', 0.0)
+    
+    print(f"✓ Resuming from epoch {start_epoch}")
+    print(f"✓ Best validation PSNR so far: {best_val_psnr:.2f} dB")
+    
+    # Print loaded configuration for verification
+    if 'opts' in checkpoint:
+        ckpt_opts = checkpoint['opts']
+        print(f"\nCheckpoint configuration:")
+        print(f"  Variant: {getattr(ckpt_opts, 'variant', 'N/A')}")
+        print(f"  Learning rate: {getattr(ckpt_opts, 'lr', 'N/A')}")
+        print(f"  Batch size: {getattr(ckpt_opts, 'batch_sz', 'N/A')}")
+    
+    return model, optimizer, lr_scheduler, start_epoch, best_val_psnr
 
 
 def get_trainable_params(model):
@@ -334,13 +393,40 @@ if __name__ == '__main__':
     # Create model based on variant
     model = get_model(opts.variant)
     
-    # Load pretrained checkpoint (selective loading)
-    model = load_pretrained_checkpoint(model, opts.pretrained_path, opts.variant)
+    # Initialize training state
+    start_epoch = 0
+    best_val_psnr = 0.0
+    resume_mode = opts.resume_checkpoint is not None
     
-    # Move model to device
+    if resume_mode:
+        print("\n📂 RESUME MODE: Loading existing ablation checkpoint")
+    else:
+        print("\n🆕 FRESH START MODE: Loading pretrained base model")
+        if opts.pretrained_path is None:
+            raise ValueError("Either --pretrained_path or --resume_checkpoint must be provided")
+    
+    # Move model to device first (needed for optimizer initialization)
     model = model.to(device)
     
-    # Freeze modules
+    # Setup optimizer and scheduler (needed before loading resume checkpoint)
+    # Only optimize trainable parameters (will be set correctly below)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=opts.lr)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=opts.lr_step, gamma=0.5
+    )
+    
+    # Load checkpoint based on mode
+    if resume_mode:
+        # Load complete training state from ablation checkpoint
+        model, optimizer, lr_scheduler, start_epoch, best_val_psnr = load_resume_checkpoint(
+            model, optimizer, lr_scheduler, opts.resume_checkpoint, opts.variant
+        )
+    else:
+        # Load pretrained checkpoint (selective loading)
+        model = load_pretrained_checkpoint(model, opts.pretrained_path, opts.variant)
+    
+    # Freeze modules (important: do this after loading, before training)
     print("\nFreezing shared modules...")
     freeze_modules(model, opts.variant)
     
@@ -359,16 +445,8 @@ if __name__ == '__main__':
         sys.exit(0)
 
     ##===================================================##
-    ##************** Setup optimizer ********************##
+    ##************** Optimizer already set up ***********##
     ##===================================================##
-    # Only optimize trainable parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    
-    optimizer = torch.optim.Adam(trainable_params, lr=opts.lr)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=opts.lr_step, gamma=0.5
-    )
-    
     # Loss function
     criterion = nn.L1Loss()
 
@@ -391,10 +469,9 @@ if __name__ == '__main__':
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f'ablation_{opts.variant}_log.json')
 
-    best_val_psnr = 0.0
     train_start_time = time.time()
 
-    for epoch in range(opts.max_epochs):
+    for epoch in range(start_epoch, opts.max_epochs):
         epoch_start_time = time.time()
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{opts.max_epochs-1} - Variant: {opts.variant}")
